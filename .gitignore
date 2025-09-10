@@ -1,0 +1,14 @@
+﻿# segredos
+.env
+.env.*
+# caches/compilados
+__pycache__/
+*.pyc
+# bancos locais / arquivos binários
+*.db
+*.sqlite
+# planilhas e binários pesados
+*.xlsx
+# outros
+*.log
+.venv/
