@@ -64,11 +64,84 @@ def send_whatsapp_message(to: str, text: str) -> dict:
     }
 
 # -----------------------------
+# LLM (Groq) para conversa livre humanizada
+# -----------------------------
+LLM_API_BASE = os.getenv("LLM_API_BASE", "").rstrip("/")
+LLM_API_KEY  = os.getenv("LLM_API_KEY", "")
+LLM_MODEL    = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+
+def llm_chat(messages: list[dict]) -> str:
+    """Chama endpoint OpenAI-compatível /v1/chat/completions."""
+    if not (LLM_API_BASE and LLM_API_KEY):
+        return ""
+    url = f"{LLM_API_BASE}/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": LLM_MODEL, "temperature": 0.4, "messages": messages}
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print("[llm error]", e)
+        return ""
+
+def llm_reply(user_text: str) -> str:
+    system = (
+        "Você é atendente da BotChina (eletrônicos). Seja educado, calmo e objetivo. "
+        "Regras: 1) Se houver irritação/ofensa, mantenha a calma, peça respeito e ofereça falar com humano. "
+        "2) Em reclamações (não gostei, extraviado, quebrado, faltou), peça nº do pedido, fotos e descrição objetiva. "
+        "3) Não prometa reembolso/troca automática; diga que abrirá ticket e verificará a política. "
+        "4) Se pedirem itens fora do escopo (alimentos/roupas), explique que vendemos eletrônicos e dê exemplos. "
+        "5) Faça perguntas de uma em uma. Respostas curtas, claras, em PT-BR."
+    )
+    msgs = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
+    out = llm_chat(msgs)
+    return out or "Posso te ajudar. Me diga o nº do pedido e o que ocorreu (produto, problema, fotos)."
+
+def looks_like_free_chat(t: str) -> bool:
+    t = (t or "").lower()
+    gatilhos = [
+        "não gostei", "nao gostei", "reclama", "reclamação", "quebrado", "rachado",
+        "faltou", "faltando", "extravi", "atrasou", "demora", "rasgado",
+        "onde vocês são", "quem são vocês", "atendente", "humano",
+        "oi", "tudo bem", "bom dia", "boa tarde", "boa noite",
+    ]
+    return any(g in t for g in gatilhos)
+
+# -----------------------------
 # Catálogo (CSV via Google Sheets)
 # -----------------------------
 SESSIONS: dict[str, dict] = {}  # estado simples por wa_id
 CATALOG = None
 CATALOG_URL = os.getenv("CATALOG_URL", "").strip()
+
+EXPECTED_COLS = ["sku","nome","sinonimos","descricao","cor","preco","moeda","lead_time","estoque","image_url"]
+
+def normalize_catalog(df: pd.DataFrame) -> pd.DataFrame:
+    # tira espaços e padroniza para minúsculas
+    df = df.rename(columns=lambda c: str(c).strip())
+    lower_map = {c: c.lower() for c in df.columns}
+    df = df.rename(columns=lower_map)
+    # sinônimos comuns
+    synonyms = {
+        "sku": "sku", "código": "sku", "codigo": "sku",
+        "nome": "nome", "produto": "nome", "nome do produto": "nome",
+        "sinonimos": "sinonimos", "sinônimos": "sinonimos", "sinonimo": "sinonimos",
+        "descricao": "descricao", "descrição": "descricao", "description": "descricao",
+        "cor": "cor", "color": "cor",
+        "preco": "preco", "preço": "preco", "price": "preco", "valor": "preco",
+        "moeda": "moeda", "currency": "moeda",
+        "lead_time": "lead_time", "lead time": "lead_time", "prazo": "lead_time",
+        "estoque": "estoque", "stock": "estoque", "qtd": "estoque",
+        "image_url": "image_url", "imagem": "image_url", "foto": "image_url", "url_imagem": "image_url",
+    }
+    df = df.rename(columns={c: synonyms.get(c, c) for c in df.columns})
+    # garante colunas e limpa
+    for col in EXPECTED_COLS:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].astype(str).fillna("").str.strip()
+    return df[EXPECTED_COLS]
 
 def load_catalog() -> None:
     """Carrega o catálogo do CSV público (CATALOG_URL)."""
@@ -78,7 +151,7 @@ def load_catalog() -> None:
         return
     try:
         df = pd.read_csv(CATALOG_URL).fillna("")
-        # Espera colunas: sku,nome,sinonimos,descricao,cor,preco,moeda,lead_time,estoque,image_url
+        df = normalize_catalog(df)
         CATALOG = df
         print(f"[catalog] loaded {len(CATALOG)} rows from {CATALOG_URL}")
     except Exception as e:
@@ -114,18 +187,39 @@ def route_command(text: str) -> str | None:
     arg = rest[0] if rest else ""
     if cmd.lower() == "/help":
         return ("👋 Posso ajudar com:\n"
-                "• Descreva o produto e a quantidade (ex: '3 amoladores de faca')\n"
+                "• Descreva o produto e a **quantidade** (ex: '3 amoladores de faca')\n"
                 "• /sku <código>\n"
-                "• /humano para falar com atendente")
+                "• /humano para falar com atendente\n"
+                "• /cancel para limpar e voltar ao menu")
     if cmd.lower() == "/humano":
         return "✅ Vou acionar um atendente humano. Envie nome/empresa e melhor horário."
     if cmd.lower() == "/sku":
         return f"Digite o código do SKU após /sku. Você enviou: {arg or '(faltou o código)'}"
+    if cmd.lower() == "/cancel":
+        return "__CANCEL__"  # sinal interno
     return "🙃 Comando não reconhecido. Digite /help."
 
 def is_greeting(t: str) -> bool:
     t = (t or "").strip().lower()
     return any(g in t for g in ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "hello", "hi", "hey"])
+
+def is_cancel(t: str) -> bool:
+    t = (t or "").strip().lower()
+    gatilhos = ["cancel", "/cancel", "cancelar", "voltar", "menu", "início", "inicio", "voltar ao menu", "menu inicial"]
+    return any(g in t for g in gatilhos)
+
+OFFTOPIC_WORDS = {
+    "alimentos": {"açaí", "acai", "pizza", "hamburguer", "hambúrguer", "sorvete", "lanche", "suco", "café", "cafe"},
+    "roupas": {"camiseta", "calça", "sapato", "tênis", "tenis", "jaqueta", "vestido"},
+    "serviços": {"passagem", "hotel", "viagem", "frete internacional"},
+}
+def detect_offtopic(text: str) -> str | None:
+    t = (text or "").lower()
+    for _, palavras in OFFTOPIC_WORDS.items():
+        for p in palavras:
+            if p in t:
+                return p
+    return None
 
 def extract_items(text: str):
     """Extrai pares quantidade + descrição. Ex.: '3 carrinhos, 5 impressoras'."""
@@ -136,8 +230,8 @@ def extract_items(text: str):
 def format_candidate_line(i, c):
     preco = f"{c.get('moeda','')}{c.get('preco','')}".strip()
     estoque = c.get('estoque','?')
-    nome = c.get('nome','').strip()
-    sku = c.get('sku','—')
+    nome = (c.get('nome','') or '').strip()
+    sku = (c.get('sku') or '—').strip()
     return f"{i}) {sku} — {nome} • {preco} • estoque: {estoque}"
 
 def show_candidates_text(to: str, query: str, cands: list):
@@ -174,8 +268,24 @@ async def receive_webhook(request: Request):
         # 1) Comandos com "/"
         cmd_reply = route_command(text_body)
         if cmd_reply:
+            if cmd_reply == "__CANCEL__":
+                sess.clear()
+                intro = ("Menu reiniciado ✅\n"
+                         "Somos a BotChina (eletrônicos). Diga o **SKU** ou descreva o produto (ex: 'impressora térmica 80mm' "
+                         "ou 'carrinho RC amarelo 1:24') e a **quantidade**. Digite /help para ver opções.")
+                send_res = send_whatsapp_message(to, intro)
+                return JSONResponse({"status":"processed","echo":intro,"send_result":send_res}, status_code=200)
             send_res = send_whatsapp_message(to, cmd_reply)
             return JSONResponse({"status": "processed", "echo": cmd_reply, "send_result": send_res}, status_code=200)
+
+        # 1.1) Cancelar por linguagem natural
+        if is_cancel(text_body):
+            sess.clear()
+            intro = ("Menu reiniciado ✅\n"
+                     "Somos a BotChina (eletrônicos). Diga o **SKU** ou descreva o produto (ex: 'impressora térmica 80mm' "
+                     "ou 'carrinho RC amarelo 1:24') e a **quantidade**. Digite /help para ver opções.")
+            send_res = send_whatsapp_message(to, intro)
+            return JSONResponse({"status":"processed","echo":intro,"send_result":send_res}, status_code=200)
 
         # 2) Escolha pendente (1/2/3)
         if sess.get("awaiting_choice"):
@@ -201,14 +311,29 @@ async def receive_webhook(request: Request):
                 qty = int(m.group())
                 item = sess.pop("pending_item")
                 resumo = f"✅ Adicionado: {qty}× {item['sku']} — {item['nome']}"
-                # (Se quiser carrinho multi-itens, aqui seria o lugar para acumular)
                 send_res = send_whatsapp_message(to, resumo)
                 return JSONResponse({"status": "processed", "echo": resumo, "send_result": send_res}, status_code=200)
             else:
                 send_res = send_whatsapp_message(to, "Quantas unidades? (envie um número)")
                 return JSONResponse({"status": "processed", "echo": "perguntando quantidade", "send_result": send_res}, status_code=200)
 
-        # 4) Small talk simples
+        # 4) Conversa livre humanizada via LLM (se não estiver em fluxo de escolha/quantidade)
+        if looks_like_free_chat(text_body):
+            reply = llm_reply(text_body)
+            if reply:
+                send_res = send_whatsapp_message(to, reply)
+                return JSONResponse({"status":"processed","echo":reply,"send_result":send_res}, status_code=200)
+
+        # 4.5) Off-topic (fora do nosso domínio)
+        off = detect_offtopic(text_body)
+        if off:
+            msg_out = (f"Entendi “{off}”, mas nós trabalhamos com **eletrônicos** "
+                       f"(ex.: amoladores de faca, impressoras térmicas 58/80mm, carrinhos RC, etiquetas). "
+                       f"Me diga o eletrônico e a quantidade 🙂")
+            send_res = send_whatsapp_message(to, msg_out)
+            return JSONResponse({"status":"processed","echo":msg_out,"send_result":send_res}, status_code=200)
+
+        # 5) Small talk simples (saudação)
         if is_greeting(text_body):
             intro = ("Olá! 👋 Somos a BotChina (atendimento 24/7).\n"
                      "Para orçamento, diga o **SKU** ou descreva o produto (ex: 'carrinho de controle remoto amarelo 1:24') "
@@ -216,15 +341,16 @@ async def receive_webhook(request: Request):
             send_res = send_whatsapp_message(to, intro)
             return JSONResponse({"status": "processed", "echo": intro, "send_result": send_res}, status_code=200)
 
-        # 5) Pedido: extrair item e buscar no catálogo
+        # 6) Pedido: extrair item e buscar no catálogo
         items = extract_items(text_body or "")
         item = items[0]  # MVP: tratamos o primeiro item
         cands = search_catalog(item["name"])
 
         if not cands:
-            ask = "Não encontrei nada ainda. Pode detalhar um pouco? (ex: cor, modelo, marca)"
-            send_res = send_whatsapp_message(to, ask)
-            return JSONResponse({"status": "processed", "echo": ask, "send_result": send_res}, status_code=200)
+            # Fallback humanizado: LLM tenta ajudar
+            reply = llm_reply(text_body)
+            send_res = send_whatsapp_message(to, reply or "Ainda não encontrei. Pode detalhar cor/modelo/marca ou informar o SKU?")
+            return JSONResponse({"status": "processed", "echo": reply, "send_result": send_res}, status_code=200)
 
         if len(cands) == 1:
             chosen = cands[0]
@@ -260,12 +386,19 @@ def debug_cfg():
         "token_len": len(cfg["WABA_TOKEN"]),
         "catalog_url": CATALOG_URL,
         "catalog_loaded_rows": (0 if CATALOG is None else len(CATALOG)),
+        "llm_base": LLM_API_BASE,
+        "llm_model": LLM_MODEL,
+        "llm_enabled": bool(LLM_API_BASE and LLM_API_KEY),
     }
 
 @app.post("/debug/reload")
 def debug_reload():
     load_catalog()
     return {"reloaded": True, "rows": 0 if CATALOG is None else len(CATALOG)}
+
+@app.get("/debug/llm")
+def debug_llm(q: str = "teste de atendimento humano"):
+    return {"sample": llm_reply(q)}
 
 @app.get("/")
 def root():
