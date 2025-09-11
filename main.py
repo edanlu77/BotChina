@@ -1,4 +1,4 @@
-# main.py — LLM 100% humanizado; consulta o Sheets SOMENTE quando solicitado
+# main.py — LLM 100% humanizado; consulta o Sheets quando a intenção pedir
 # Comandos opcionais: /sku <código>, /buscar <termos>, /help, /cancel
 
 import os, re, io, json, time, requests, pandas as pd
@@ -55,12 +55,15 @@ LLM_API_KEY  = os.getenv("LLM_API_KEY","")
 LLM_MODEL    = os.getenv("LLM_MODEL","llama-3.3-70b-versatile")
 
 HUMAN_SYSTEM_PROMPT = """
-Você é o BotChina (eletrônicos). Seja 100% humano, gentil e objetivo.
-Prioridade: CONVERSAR naturalmente. Use 1–2 frases, sem textão.
-Só consulte o catálogo quando o cliente solicitar catálogo/produtos/orçamento/preço/valor/quanto/estoque/disponível/SKU/código
-ou pedir para procurar (ex.: “busca”, “pesquisa”, “procurar”).
-Se pedir orçamento/preço/estoque sem especificar, você mesmo pergunta o item e então aciona a consulta.
-Em reclamações: peça nº do pedido + fotos + descrição curta. Em despedidas, cumprimente pelo período (bom dia/tarde/noite).
+Você é o BotChina (eletrônicos). Fale 100% humano, gentil e objetivo.
+Estilo: 1–2 frases, sem textão. Evite saudações por período (bom dia/tarde/noite);
+use “Olá” ou responda direto, a não ser que o cliente se despeça — aí encerre com
+uma saudação adequada (“Boa noite! Qualquer coisa, é só chamar.”).
+Você só consulta o catálogo quando a intenção for clara: catálogo/produtos/orçamento/
+preço/valor/quanto/estoque/disponível/SKU/código ou quando pedirem buscar/pesquisar/procurar.
+Se pedirem preço/estoque sem especificar o item, pergunte qual produto e então consulte.
+Se for fora de escopo (ex.: alimentos), explique com carinho que vendemos eletrônicos e dê exemplos.
+Em reclamações: peça nº do pedido + fotos + descrição curta.
 """
 
 def llm_chat(messages: list[dict]) -> str:
@@ -81,7 +84,7 @@ def llm_reply(user_text: str) -> str:
     return out or "Posso ajudar — me diga o que precisa. 🙂"
 
 # ------------------------------------------------------------------------------
-# Catálogo (Sheets CSV) — consulta apenas sob intenção de catálogo
+# Catálogo (Sheets CSV) — consulta quando a intenção pedir
 # ------------------------------------------------------------------------------
 CACHE = {"df": None, "ts": 0}
 CACHE_TTL = 300
@@ -112,6 +115,37 @@ def normalize_catalog(df: pd.DataFrame) -> pd.DataFrame:
     df["name_norm"] = (df["nome"] + " " + df["sinonimos"] + " " + df["descricao"]).str.lower()
     return df[EXPECTED_COLS + ["sku_norm","name_norm"]]
 
+# ----- Vocabulário dinâmico (palavras e bigramas do catálogo) -----
+PRODUCT_TERMS: set[str] = set()
+PRODUCT_TERMS_TS = 0
+
+STOPWORDS_PT = {"de","da","do","das","dos","para","pra","por","o","a","os","as","um","uma","no","na","em","e","ou","que","com","sem","pro","pra","ao","à","às","aos"}
+STOPWORDS_EXTRA = {"mm","x","rc","usb","lan"}  # ruídos comuns
+
+def _tokenize(s: str) -> list[str]:
+    s = (s or "").lower()
+    s = re.compile(r"\b1[:/]\d{1,3}\b", re.IGNORECASE).sub(" ", s)  # remove 1:24, 1/10...
+    toks = re.findall(r"[a-z0-9\u00C0-\u017F]{2,}", s)
+    return [t for t in toks if t not in STOPWORDS_PT and t not in STOPWORDS_EXTRA]
+
+def _bigrams(tokens: list[str]) -> list[str]:
+    return [" ".join(tokens[i:i+2]) for i in range(len(tokens)-1)]
+
+def refresh_product_terms(df: pd.DataFrame):
+    global PRODUCT_TERMS, PRODUCT_TERMS_TS
+    terms = set()
+    for _, r in df.iterrows():
+        txt = f"{r.get('name_norm','')}"
+        toks = _tokenize(txt)
+        for t in toks:
+            if len(t) >= 3:
+                terms.add(t)
+        for bg in _bigrams(toks):
+            if len(bg) >= 5:
+                terms.add(bg)
+    PRODUCT_TERMS = terms
+    PRODUCT_TERMS_TS = time.time()
+
 def load_catalog(force: bool=False) -> pd.DataFrame | None:
     global LAST_CATALOG_ERR
     url = ensure_csv_url(os.getenv("CATALOG_URL","").strip())
@@ -126,7 +160,8 @@ def load_catalog(force: bool=False) -> pd.DataFrame | None:
         df = pd.read_csv(io.StringIO(resp.text)).fillna("")
         df = normalize_catalog(df)
         CACHE.update({"df": df, "ts": now}); LAST_CATALOG_ERR = ""
-        print(f"[catalog] loaded {len(df)} rows")
+        refresh_product_terms(df)  # atualiza vocabulário dinâmico
+        print(f"[catalog] loaded {len(df)} rows; vocab={len(PRODUCT_TERMS)}")
         return df
     except Exception as e:
         LAST_CATALOG_ERR = f"{type(e).__name__}: {e}"
@@ -147,7 +182,6 @@ def find_by_name(query: str, topn: int = 3):
     sc["score"] = sc["name_norm"].apply(lambda s: SequenceMatcher(a=q, b=s).ratio())
     sc = sc.sort_values("score", ascending=False)
     rows = sc.head(topn)
-    # também aceita substring direta caso a similaridade não seja alta
     results = [r.to_dict() for _, r in rows.iterrows() if r["score"] > 0.30]
     if not results and q:
         subs = df[df["name_norm"].str.contains(re.escape(q), na=False)]
@@ -162,34 +196,43 @@ def fmt_price(preco: str, moeda: str) -> str:
     return f"{moeda} {preco}".strip()
 
 # ------------------------------------------------------------------------------
-# Intenção de catálogo (sempre consulta o Sheets) + comandos
+# Intenção de catálogo (dinâmica) + comandos
 # ------------------------------------------------------------------------------
 SKU_REGEX   = re.compile(r"\b[A-Z]{2,6}-\d{2,6}\b")
 SCALE_REGEX = re.compile(r"\b1[:/]\d{1,3}\b", re.IGNORECASE)
 
-CATALOG_TRIGGERS = {
-    "catálogo","catalogo","produtos","produto","lista",
-    "orçamento","orcamento","cotação","cotacao",
-    "preço","preco","valor","custa","quanto",
-    "estoque","disponível","disponivel","sku","código","codigo",
-    "tabela","price list","price-list","buscar","pesquisar","procurar","procura","pesquisa"
+GENERIC_VERBS = {
+    "tem","vende","possui","trabalha","trabalham","catalogo","catálogo","produtos","produto","listar","lista","tabela",
+    "orçamento","orcamento","cotação","cotacao","preço","preco","valor","custa","quanto","estoque","disponível","disponivel",
+    "buscar","pesquisar","procurar","procura","pesquisa","modelo","peça","peca","acessório","acessorio"
 }
 
-STOPWORDS_PT = {"de","da","do","das","dos","para","pra","por","o","a","os","as","um","uma","no","na","em","e","ou","que","com"}
+def extract_keywords(t: str) -> list[str]:
+    return _tokenize(t or "")
 
 def is_catalog_intent(t: str) -> bool:
-    if not t: return False
-    u = t.lower()
+    if not t: 
+        return False
+    u = (t or "").lower()
+    # 1) SKU explícito
     if SKU_REGEX.search(t): 
         return True
-    if any(w in u for w in CATALOG_TRIGGERS):
+    # 2) Verbos/gatilhos genéricos
+    if any(w in u for w in GENERIC_VERBS):
         return True
-    return False
-
-def extract_keywords(t: str) -> list[str]:
-    u = SCALE_REGEX.sub(" ", (t or "").lower())
-    toks = re.findall(r"[a-z0-9\u00C0-\u017F]{2,}", u)
-    return [w for w in toks if w not in STOPWORDS_PT]
+    # 3) "tem <substantivo>" (qualquer)
+    if re.search(r"\b(?:vo(?:c|ç)es?\s+)?tem\s+[a-z0-9\u00C0-\u017F]{3,}", u):
+        return True
+    # 4) Interseção com vocabulário dinâmico do catálogo (tokens/bigramas)
+    kws = extract_keywords(u)
+    if kws and any(k in PRODUCT_TERMS for k in kws):
+        return True
+    bigs = _bigrams(kws)
+    if bigs and any(bg in PRODUCT_TERMS for bg in bigs):
+        return True
+    # 5) Heurística final
+    long_kws = [k for k in kws if len(k) >= 3]
+    return len(long_kws) >= 2
 
 def reply_catalog_overview(to: str, df: pd.DataFrame, limit: int = 6):
     rows = [] if df is None else df.head(limit).to_dict(orient="records")
@@ -198,11 +241,17 @@ def reply_catalog_overview(to: str, df: pd.DataFrame, limit: int = 6):
     lines = ["Aqui vão algumas opções do nosso catálogo:"]
     for r in rows:
         preco = fmt_price(r.get("preco",""), r.get("moeda",""))
-        lines.append(f"- {r.get('sku','—')} — {r.get('nome','')} • {preco} • estoque: {r.get('estoque','—')}")
+        estoque = r.get("estoque","—")
+        lines.append(f"- {r.get('sku','—')} — {r.get('nome','')} • {preco} • estoque: {estoque}")
     lines.append("Se quiser, me diga o **SKU** ou descreva o produto que eu detalho 😉")
     return send_whatsapp_message(to, "\n".join(lines))
 
 def reply_catalog_search(to: str, query: str):
+    df = load_catalog()
+    if df is None:
+        return send_whatsapp_message(to, "Não consegui acessar o catálogo agora. Pode tentar novamente?")
+
+    # 1) SKU direto
     m = SKU_REGEX.search(query or "")
     if m:
         item = find_by_sku(m.group(0))
@@ -211,12 +260,26 @@ def reply_catalog_search(to: str, query: str):
             out = (f"{item.get('sku','—')} — {item.get('nome','')}\n"
                    f"Preço: {preco} | Estoque: {item.get('estoque','—')} | Prazo: {item.get('lead_time','—')}")
             return send_whatsapp_message(to, out)
-    kws = extract_keywords(query or "")
-    q = " ".join(kws)
-    cands = find_by_name(q) if q else []
+
+    # 2) Termos (tokens + bigramas) → filtro por substring (AND suave)
+    toks = extract_keywords(query or "")
+    bigs = _bigrams(toks)
+    qterms = [*bigs, *toks] if bigs else toks
+    cand = df
+    for qt in qterms[:5]:  # limita custo
+        cand = cand[cand["name_norm"].str.contains(re.escape(qt), na=False)]
+        if cand.empty:
+            break
+
+    if cand.empty:
+        # 3) Fallback: similaridade geral
+        cands = find_by_name(" ".join(toks)) if toks else []
+    else:
+        cands = cand.head(3).to_dict(orient="records")
+
     if not cands:
-        df = load_catalog()
-        return reply_catalog_overview(to, df if df is not None else pd.DataFrame())
+        return reply_catalog_overview(to, df)
+
     lines = []
     for c in cands[:3]:
         preco = fmt_price(c.get("preco",""), c.get("moeda",""))
@@ -237,7 +300,7 @@ def route_command(text: str) -> tuple[str,str] | None:
     return ("unknown","")
 
 # ------------------------------------------------------------------------------
-# Webhook principal — LLM total; Sheets apenas quando a intenção pedir
+# Webhook principal — LLM total; Sheets quando a intenção pedir
 # ------------------------------------------------------------------------------
 @app.post("/webhook")
 async def receive_webhook(request: Request):
@@ -256,12 +319,12 @@ async def receive_webhook(request: Request):
         text_body = msg.get("text", {}).get("body", "") if msg_type == "text" else ""
         to = f"+{wa_from}"
 
-        # 1) Comandos explícitos
+        # 1) Comandos
         routed = route_command(text_body)
         if routed:
             kind, arg = routed
             if kind == "help":
-                out = ("Pode falar normal comigo 😊\n"
+                out = ("Pode falar comigo normalmente 😊\n"
                        "Para consultar o catálogo: /sku RC-124 ou /buscar impressora 80mm\n"
                        "Para cancelar: /cancel")
                 send_whatsapp_message(to, out)
@@ -293,14 +356,14 @@ async def receive_webhook(request: Request):
                     out = "Me diga o que buscar, ex.: /buscar impressora térmica 80mm"
                     send_whatsapp_message(to, out)
                     return JSONResponse({"status":"processed","echo":out}, status_code=200)
-                send_res = reply_catalog_search(to, arg)
+                reply_catalog_search(to, arg)
                 return JSONResponse({"status":"processed","echo":"catalog_search_cmd"}, status_code=200)
 
             out = "Não reconheci esse comando. Use /help 😉"
             send_whatsapp_message(to, out)
             return JSONResponse({"status":"processed","echo":out}, status_code=200)
 
-        # 2) Intenção explícita de catálogo/produtos/orçamento → SEMPRE consulta o Sheets
+        # 2) Intenção de catálogo/produtos/orçamento (genérica) → consulta Sheets
         if is_catalog_intent(text_body):
             df = load_catalog()
             kws = extract_keywords(text_body)
@@ -330,7 +393,8 @@ def debug_catalog(n: int = 5):
     return {
         "rows": rows, "cols": cols, "sample": sample,
         "last_error": LAST_CATALOG_ERR,
-        "catalog_url": ensure_csv_url(os.getenv("CATALOG_URL","").strip())
+        "catalog_url": ensure_csv_url(os.getenv("CATALOG_URL","").strip()),
+        "vocab_size": len(PRODUCT_TERMS),
     }
 
 @app.get("/")
