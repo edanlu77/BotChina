@@ -2,7 +2,9 @@
 # Papel: professor bíblico cristocêntrico (foco em Cristo)
 # Integração: Webhook do WhatsApp (Meta) + API LLM compatível com OpenAI
 
-import os, json, requests
+import os
+import json
+import requests
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from dotenv import load_dotenv
@@ -35,21 +37,41 @@ def get_cfg():
     }
 
 def send_whatsapp_message(to: str, text: str) -> dict:
+    """Envia mensagem para o WhatsApp Cloud API. 'to' deve ser sem '+'."""
     cfg = get_cfg()
     url = f"https://graph.facebook.com/{cfg['GRAPH_VERSION']}/{cfg['WABA_PHONE_NUMBER_ID']}/messages"
-    headers = {"Authorization": f"Bearer {cfg['WABA_TOKEN']}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {cfg['WABA_TOKEN']}",
+        "Content-Type": "application/json",
+    }
     payload = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "to": str(to).lstrip("+"),  # <= importante: sem '+'
         "type": "text",
         "text": {"preview_url": False, "body": text},
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
     try:
-        data = r.json()
-    except Exception:
-        data = {"raw": r.text}
-    return {"status_code": r.status_code, "data": data, "url": url}
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text}
+        res = {
+            "status_code": r.status_code,
+            "data": data,
+            "debug_used": {
+                "url": url,
+                "graph_version": cfg["GRAPH_VERSION"],
+                "phone_number_id": cfg["WABA_PHONE_NUMBER_ID"],
+                "token_tail": cfg["WABA_TOKEN"][-8:] if cfg["WABA_TOKEN"] else "",
+            },
+        }
+        print("[send_whatsapp_message]", json.dumps(res, ensure_ascii=False))
+        return res
+    except Exception as e:
+        err = {"status_code": 0, "error": str(e)}
+        print("[send_whatsapp_message][error]", err)
+        return err
 
 # -----------------------------
 # LLM (OpenAI-compatible)
@@ -84,9 +106,10 @@ def llm_chat(messages: list[dict]) -> str:
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         data = resp.json()
-        return (data.get("choices",[{}])[0].get("message",{}).get("content","")).strip() or "Posso ajudar com um estudo bíblico. Qual a sua dúvida?"
+        content = (data.get("choices",[{}])[0].get("message",{}).get("content","")).strip()
+        return content or "Posso ajudar com um estudo bíblico. Qual a sua dúvida?"
     except Exception as e:
-        print("[llm error]", e)
+        print("[llm_chat][error]", str(e))
         return "Tive um problema para gerar a resposta agora. Pode perguntar de novo?"
 
 def llm_reply(user_text: str) -> str:
@@ -94,9 +117,10 @@ def llm_reply(user_text: str) -> str:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_text or ""},
     ]
-    out = llm_chat(msgs)
+    out = llm_chat(msgs).strip()
     # Evita despedidas automáticas fora de contexto
-    if out.lower().strip() in {"tchau", "até logo", "ate logo"}:
+    low = out.lower()
+    if low in {"tchau", "até logo", "ate logo", "até mais", "ate mais"}:
         out = "Posso ajudar com uma passagem ou tema específico?"
     return out
 
@@ -106,6 +130,7 @@ def llm_reply(user_text: str) -> str:
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     body = await request.json()
+    print("Incoming webhook:", json.dumps(body, ensure_ascii=False))  # log bruto para depurar
     try:
         entry = body.get("entry", [])[0]
         change = entry.get("changes", [])[0]
@@ -115,23 +140,35 @@ async def receive_webhook(request: Request):
             return JSONResponse({"status": "ignored"}, status_code=200)
 
         msg = messages[0]
-        wa_from = msg.get("from")  # ex.: '55119...'
+        wa_from = msg.get("from")  # ex.: '5511999999999'
         msg_type = msg.get("type")
         text_body = msg.get("text", {}).get("body", "") if msg_type == "text" else ""
 
-        to = f"+{wa_from}"
+        # WhatsApp Cloud API espera o 'to' sem '+'
+        to = str(wa_from).lstrip("+")
 
         # Chat 100% LLM (professor bíblico)
         reply = llm_reply(text_body)
         send_res = send_whatsapp_message(to, reply)
-        return JSONResponse({"status": "processed", "echo": reply, "send_result": send_res}, status_code=200)
+        return JSONResponse(
+            {"status": "processed", "echo": reply, "send_result": send_res},
+            status_code=200
+        )
 
     except Exception as e:
+        print("[webhook][error]", str(e))
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=200)
 
 # -----------------------------
-# Healthcheck
+# Debug / Health
 # -----------------------------
+@app.get("/debug/send")
+def debug_send(to: str, text: str = "ping"):
+    """Envio de teste direto via URL (sem depender do LLM)."""
+    to_clean = str(to).lstrip("+")
+    res = send_whatsapp_message(to_clean, text)
+    return {"ok": True, "to": to_clean, "result": res}
+
 @app.get("/")
 def root():
     return {"ok": True}
