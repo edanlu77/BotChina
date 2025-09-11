@@ -1,4 +1,10 @@
-# main.py — LLM 100% humanizado; consulta o Sheets quando a intenção pedir (regra única, vocabulário dinâmico)
+# main.py — LLM 100% humanizado; consulta o Sheets só quando a intenção pedir
+# Regras mínimas:
+# - Conversa sempre pelo LLM (curto e humano).
+# - Consulta catálogo APENAS quando a intenção for clara (catálogo/produto/orçamento/preço/estoque/SKU/buscar)
+#   ou quando "tem X?" e X existir no vocabulário extraído do próprio Sheets.
+# - "Quais produtos / catálogo / lista / tabela" → overview.
+# - Fora disso, segue no papo normal (sem catálogo).
 
 import os, re, io, time, json, requests, pandas as pd
 from difflib import SequenceMatcher
@@ -44,12 +50,11 @@ LLM_API_KEY  = os.getenv("LLM_API_KEY","")
 LLM_MODEL    = os.getenv("LLM_MODEL","llama-3.3-70b-versatile")
 
 HUMAN_SYSTEM_PROMPT = """
-Você é o BotChina (eletrônicos). Fale humano, gentil e objetivo.
-Responda em 1–2 frases, sem textão. Evite “bom dia/tarde/noite” automáticos;
-use “Olá” ou responda direto. Em despedida, uma saudação breve.
-Você só consulta o catálogo quando a intenção for clara de catálogo/produto/
-orçamento/preço/valor/quanto/estoque/SKU/código ou quando pedirem buscar/pesquisar/procurar.
-Quando consultado, responda curto com opções claras.
+Você é o BotChina (eletrônicos). Responda humano, curto (1–2 frases), direto e educado.
+Evite “bom dia/tarde/noite” automáticos; use “Olá” ou responda direto. Só use “tchau/até logo” se o cliente claramente se despedir.
+Catálogo: consulte apenas quando a intenção for clara (catálogo/produto/orçamento/preço/valor/quanto/estoque/disponível/SKU/código
+ou quando pedirem buscar/pesquisar/procurar). Se pedirem itens fora de eletrônicos, explique com carinho que vendemos eletrônicos
+e siga a conversa. Em reclamações: peça nº do pedido + fotos + descrição curta.
 """
 
 def llm_chat(messages: list[dict]) -> str:
@@ -174,11 +179,13 @@ def find_by_name(query: str, topn: int = 3):
 
 def fmt_price(preco: str, moeda: str) -> str:
     if (moeda or "").upper() == "BRL":
-        try: return "R$ " + f"{float(str(preco).replace(',','.')):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        except: return "R$ " + str(preco).replace(".", ",")
+        try:
+            return "R$ " + f"{float(str(preco).replace(',','.')):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        except:
+            return "R$ " + str(preco).replace(".", ",")
     return f"{moeda} {preco}".strip()
 
-# ----------------- Intenção de Catálogo (regra única) -----------------
+# ----------------- Intenção de Catálogo (precisa e mínima) -----------------
 GENERIC_TRIGGERS = {
     "catálogo","catalogo","produto","produtos","lista","tabela",
     "orçamento","orcamento","cotação","cotacao",
@@ -188,23 +195,46 @@ GENERIC_TRIGGERS = {
     "buscar","pesquisar","procurar","procura","pesquisa"
 }
 
+def noun_after_tem(u: str) -> str | None:
+    m = re.search(r"\b(?:vo(?:c|ç)es?\s+)?tem\s+([a-z0-9\u00C0-\u017F]{3,})", u)
+    return (m.group(1) if m else None)
+
+def catalog_overview_requested(u: str) -> bool:
+    u = u.lower()
+    return ("quais produtos" in u) or ("catalogo" in u) or ("catálogo" in u) or ("lista" in u) or ("tabela" in u)
+
 def is_catalog_intent(t: str) -> bool:
-    if not t: return False
+    if not t: 
+        return False
     u = t.lower()
-    if SKU_REGEX.search(t):  # SKU explícito
+
+    # 1) SKU explícito
+    if SKU_REGEX.search(t):
         return True
-    if any(w in u for w in GENERIC_TRIGGERS):  # verbos/termos genéricos
+
+    # 2) Palavras-gatilho claras (catálogo/produtos/orçamento/preço/estoque/buscar…)
+    if any(w in u for w in GENERIC_TRIGGERS):
         return True
-    # “tem <algo>?” → trata como produto
-    if re.search(r"\b(?:vo(?:c|ç)es?\s+)?tem\s+[a-z0-9\u00C0-\u017F]{3,}", u):
-        return True
-    # interseção com vocabulário do próprio catálogo
-    toks = _tokenize(u)
-    bigs = _bigrams(toks)
+
+    # 3) "tem X?" → só se X existe no vocabulário do catálogo
+    noun = noun_after_tem(u)
+    if noun:
+        if noun in PRODUCT_TERMS:
+            return True
+        toks = _tokenize(u)
+        for bg in _bigrams(toks):
+            if bg in PRODUCT_TERMS:
+                return True
+        return False  # X não é produto do catálogo → não aciona
+
+    # 4) Interseção com vocabulário do catálogo na frase
+    toks = _tokenize(u); bigs = _bigrams(toks)
     if any(k in PRODUCT_TERMS for k in toks): return True
     if any(bg in PRODUCT_TERMS for bg in bigs): return True
+
     return False
 
+# ----------------- Respostas de catálogo -----------------
 def reply_catalog_overview(to: str, df: pd.DataFrame, limit: int = 6):
     rows = [] if df is None else df.head(limit).to_dict(orient="records")
     if not rows:
@@ -220,6 +250,8 @@ def reply_catalog_search(to: str, query: str):
     df = load_catalog()
     if df is None:
         return send_whatsapp_message(to, "Não consegui acessar o catálogo agora. Pode tentar novamente?")
+
+    # 1) SKU direto
     m = SKU_REGEX.search(query or "")
     if m:
         item = find_by_sku(m.group(0))
@@ -228,6 +260,8 @@ def reply_catalog_search(to: str, query: str):
             out = (f"{item.get('sku','—')} — {item.get('nome','')}\n"
                    f"Preço: {preco} | Estoque: {item.get('estoque','—')} | Prazo: {item.get('lead_time','—')}")
             return send_whatsapp_message(to, out)
+
+    # 2) Termos (tokens + bigramas) → filtro por substring (AND suave)
     toks = _tokenize(query or "")
     bigs = _bigrams(toks)
     qterms = [*bigs, *toks] if bigs else toks
@@ -239,8 +273,10 @@ def reply_catalog_search(to: str, query: str):
         cands = find_by_name(" ".join(toks)) if toks else []
     else:
         cands = cand.head(3).to_dict(orient="records")
+
     if not cands:
         return reply_catalog_overview(to, df)
+
     lines = []
     for c in cands[:3]:
         preco = fmt_price(c.get("preco",""), c.get("moeda",""))
@@ -311,11 +347,10 @@ async def receive_webhook(request: Request):
 
             send_whatsapp_message(to, "Não reconheci esse comando. Use /help 😉"); return JSONResponse({"status":"processed"}, status_code=200)
 
-        # 2) Regra ÚNICA: intenção de catálogo/produto/orçamento → consulta Sheets
+        # 2) Regra de intenção: só consulta Sheets quando fizer sentido
         if is_catalog_intent(text_body):
             df = load_catalog()
-            toks = _tokenize(text_body)
-            if not toks and df is not None:
+            if catalog_overview_requested(text_body) and df is not None:
                 reply_catalog_overview(to, df); return JSONResponse({"status":"processed"}, status_code=200)
             reply_catalog_search(to, text_body); return JSONResponse({"status":"processed"}, status_code=200)
 
