@@ -1,10 +1,12 @@
 # main.py — LLM 100% humanizado; consulta o Sheets só quando a intenção pedir
-# Regras mínimas:
-# - Conversa sempre pelo LLM (curto e humano).
-# - Consulta catálogo APENAS quando a intenção for clara (catálogo/produto/orçamento/preço/estoque/SKU/buscar)
-#   ou quando "tem X?" e X existir no vocabulário extraído do próprio Sheets.
-# - "Quais produtos / catálogo / lista / tabela" → overview.
-# - Fora disso, segue no papo normal (sem catálogo).
+# Regras simples:
+# - Conversa SEMPRE via LLM (respostas curtas e humanas).
+# - Consulta catálogo APENAS quando:
+#     a) há SKU explícito, OU
+#     b) a mensagem tem termos claros (catálogo/produto/orçamento/preço/estoque/buscar...), OU
+#     c) é "tem X?" e X existe no vocabulário extraído do próprio Sheets.
+# - "quais produtos / catálogo / lista / tabela" → overview do catálogo.
+# - Sem “tchau” automático; só se o usuário se despedir.
 
 import os, re, io, time, json, requests, pandas as pd
 from difflib import SequenceMatcher
@@ -40,8 +42,10 @@ def send_whatsapp_message(to: str, text: str) -> dict:
     headers = {"Authorization": f"Bearer {cfg['WABA_TOKEN']}", "Content-Type": "application/json"}
     payload = {"messaging_product":"whatsapp","to":to,"type":"text","text":{"preview_url":False,"body":text}}
     r = requests.post(url, headers=headers, json=payload, timeout=30)
-    try: data = r.json()
-    except: data = {"raw": r.text}
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
     return {"status_code": r.status_code, "data": data, "url": url}
 
 # ----------------- LLM (Groq/OpenAI compat) -----------------
@@ -58,7 +62,8 @@ e siga a conversa. Em reclamações: peça nº do pedido + fotos + descrição c
 """
 
 def llm_chat(messages: list[dict]) -> str:
-    if not (LLM_API_BASE and LLM_API_KEY): return ""
+    if not (LLM_API_BASE and LLM_API_KEY):
+        return ""
     url = f"{LLM_API_BASE}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": LLM_MODEL, "temperature": 0.4, "max_tokens": 180, "messages": messages}
@@ -67,12 +72,24 @@ def llm_chat(messages: list[dict]) -> str:
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        print("[llm error]", e); return ""
+        print("[llm error]", e)
+        return ""
+
+# ----- Sem “tchau” automático (só se o usuário se despediu) -----
+FAREWELL_RE = re.compile(r"\b(tchau|até logo|ate logo|até mais|ate mais|boa noite|bom descanso)\b", re.IGNORECASE)
+def user_is_farewell(t: str) -> bool:
+    return bool(FAREWELL_RE.search(t or ""))
+
+def clean_farewell(user_text: str, reply: str) -> str:
+    if user_is_farewell(user_text):
+        return reply
+    lines = [ln for ln in (reply or "").splitlines() if not re.search(r"\b(tchau|até logo|ate logo)\b", ln, re.IGNORECASE)]
+    return "\n".join(lines).strip()
 
 def llm_reply(user_text: str) -> str:
     msgs = [{"role":"system","content":HUMAN_SYSTEM_PROMPT},{"role":"user","content":user_text}]
-    out = llm_chat(msgs)
-    return out or "Posso ajudar — me diga o que precisa. 🙂"
+    out = llm_chat(msgs) or "Posso ajudar — me diga o que precisa. 🙂"
+    return clean_farewell(user_text, out)
 
 # ----------------- Catálogo (Sheets CSV) -----------------
 CACHE = {"df": None, "ts": 0}
@@ -87,23 +104,30 @@ SCALE_REGEX = re.compile(r"\b1[:/]\d{1,3}\b", re.IGNORECASE)
 PRODUCT_TERMS: set[str] = set()
 
 def ensure_csv_url(url: str) -> str:
-    if not url: return url
+    if not url:
+        return url
     u = url.strip()
-    if "output=csv" in u or "format=csv" in u: return u
-    if "/edit" in u: return u.split("/edit")[0] + "/export?format=csv"
+    if "output=csv" in u or "format=csv" in u:
+        return u
+    if "/edit" in u:
+        return u.split("/edit")[0] + "/export?format=csv"
     return u
 
 def maybe_fix_mojibake(s: str) -> str:
-    if not isinstance(s, str): return s
+    if not isinstance(s, str):
+        return s
     if "Ã" in s or "�" in s:
-        try: return s.encode("latin1").decode("utf-8")
-        except: return s
+        try:
+            return s.encode("latin1").decode("utf-8")
+        except Exception:
+            return s
     return s
 
 def normalize_catalog(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=lambda c: str(c).strip().lower())
     for col in EXPECTED_COLS:
-        if col not in df.columns: df[col] = ""
+        if col not in df.columns:
+            df[col] = ""
         df[col] = df[col].astype(str).fillna("").apply(maybe_fix_mojibake).str.strip()
     df["sku_norm"]  = df["sku"].str.upper().str.strip()
     df["name_norm"] = (df["nome"] + " " + df["sinonimos"] + " " + df["descricao"]).str.lower()
@@ -111,11 +135,17 @@ def normalize_catalog(df: pd.DataFrame) -> pd.DataFrame:
 
 def _tokenize(s: str) -> list[str]:
     s = (s or "").lower()
-    s = SCALE_REGEX.sub(" ", s)
+    s = SCALE_REGEX.sub(" ", s)  # remove 1:24 etc.
     toks = re.findall(r"[a-z0-9\u00C0-\u017F]{2,}", s)
-    # stopwords leves para reduzir ruído
-    STOP = {"de","da","do","das","dos","para","pra","por","o","a","os","as","um","uma","no","na","em","e","ou","que","com","sem","pro","pra","ao","à","às","aos","mm","x","usb","lan","rc"}
-    return [t for t in toks if t not in STOP]
+    STOP = {
+        "de","da","do","das","dos","para","pra","por","o","a","os","as","um","uma","no","na","em","e","ou","que","com","sem",
+        "pro","pra","ao","à","às","aos","mm","x","usb","lan","rc",
+        # ruídos de pedido/quantidade que atrapalham a busca
+        "pedido","pedir","tirar","fazer","quantidade","qtd","peca","peça","pecas","peças","un","unid","unidade","unidades",
+        "tem","vocês","voces","loja","estoque"
+    }
+    cleaned = [t for t in toks if t not in STOP and not t.isdigit()]
+    return cleaned
 
 def _bigrams(tokens: list[str]) -> list[str]:
     return [" ".join(tokens[i:i+2]) for i in range(len(tokens)-1)]
@@ -138,7 +168,9 @@ def load_catalog(force: bool=False) -> pd.DataFrame | None:
     global LAST_CATALOG_ERR
     url = ensure_csv_url(os.getenv("CATALOG_URL","").strip())
     if not url:
-        LAST_CATALOG_ERR = "CATALOG_URL vazio"; CACHE.update({"df":None,"ts":0}); return None
+        LAST_CATALOG_ERR = "CATALOG_URL vazio"
+        CACHE.update({"df":None,"ts":0})
+        return None
     now = time.time()
     if not force and CACHE["df"] is not None and (now - CACHE["ts"]) < CACHE_TTL:
         return CACHE["df"]
@@ -158,13 +190,15 @@ def load_catalog(force: bool=False) -> pd.DataFrame | None:
 
 def find_by_sku(code: str):
     df = load_catalog()
-    if df is None: return None
+    if df is None:
+        return None
     row = df[df["sku_norm"] == str(code).upper().strip()]
     return (row.iloc[0].to_dict() if not row.empty else None)
 
 def find_by_name(query: str, topn: int = 3):
     df = load_catalog()
-    if df is None: return []
+    if df is None:
+        return []
     q = (query or "").strip().lower()
     sc = df.copy()
     sc["score"] = sc["name_norm"].apply(lambda s: SequenceMatcher(a=q, b=s).ratio())
@@ -181,7 +215,7 @@ def fmt_price(preco: str, moeda: str) -> str:
     if (moeda or "").upper() == "BRL":
         try:
             return "R$ " + f"{float(str(preco).replace(',','.')):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        except:
+        except Exception:
             return "R$ " + str(preco).replace(".", ",")
     return f"{moeda} {preco}".strip()
 
@@ -199,12 +233,24 @@ def noun_after_tem(u: str) -> str | None:
     m = re.search(r"\b(?:vo(?:c|ç)es?\s+)?tem\s+([a-z0-9\u00C0-\u017F]{3,})", u)
     return (m.group(1) if m else None)
 
+def noun_in_catalog(noun: str) -> bool:
+    if not noun:
+        return False
+    n = noun.lower()
+    if n in PRODUCT_TERMS:
+        return True
+    toks = _tokenize(n)
+    for bg in _bigrams(toks):
+        if bg in PRODUCT_TERMS:
+            return True
+    return False
+
 def catalog_overview_requested(u: str) -> bool:
     u = u.lower()
     return ("quais produtos" in u) or ("catalogo" in u) or ("catálogo" in u) or ("lista" in u) or ("tabela" in u)
 
 def is_catalog_intent(t: str) -> bool:
-    if not t: 
+    if not t:
         return False
     u = t.lower()
 
@@ -212,25 +258,23 @@ def is_catalog_intent(t: str) -> bool:
     if SKU_REGEX.search(t):
         return True
 
-    # 2) Palavras-gatilho claras (catálogo/produtos/orçamento/preço/estoque/buscar…)
+    # 2) Palavras-gatilho (catálogo/produtos/orçamento/preço/estoque/buscar…)
     if any(w in u for w in GENERIC_TRIGGERS):
         return True
 
-    # 3) "tem X?" → só se X existe no vocabulário do catálogo
+    # 3) "tem X?" → só se X existir no vocabulário do catálogo
     noun = noun_after_tem(u)
     if noun:
-        if noun in PRODUCT_TERMS:
+        if noun_in_catalog(noun):
             return True
-        toks = _tokenize(u)
-        for bg in _bigrams(toks):
-            if bg in PRODUCT_TERMS:
-                return True
-        return False  # X não é produto do catálogo → não aciona
+        return False  # evita acionar para "açaí", "pudim", etc.
 
     # 4) Interseção com vocabulário do catálogo na frase
     toks = _tokenize(u); bigs = _bigrams(toks)
-    if any(k in PRODUCT_TERMS for k in toks): return True
-    if any(bg in PRODUCT_TERMS for bg in bigs): return True
+    if any(k in PRODUCT_TERMS for k in toks):
+        return True
+    if any(bg in PRODUCT_TERMS for bg in bigs):
+        return True
 
     return False
 
@@ -268,7 +312,9 @@ def reply_catalog_search(to: str, query: str):
     cand = df
     for qt in qterms[:5]:
         cand = cand[cand["name_norm"].str.contains(re.escape(qt), na=False)]
-        if cand.empty: break
+        if cand.empty:
+            break
+
     if cand.empty:
         cands = find_by_name(" ".join(toks)) if toks else []
     else:
@@ -287,7 +333,8 @@ def reply_catalog_search(to: str, query: str):
 # ----------------- Comandos opcionais -----------------
 def route_command(text: str) -> tuple[str,str] | None:
     t = (text or "").strip()
-    if not t.startswith("/"): return None
+    if not t.startswith("/"):
+        return None
     cmd, *rest = t.split(maxsplit=1)
     arg = rest[0].strip() if rest else ""
     cmd = cmd.lower()
@@ -313,7 +360,16 @@ async def receive_webhook(request: Request):
         wa_from = msg.get("from")
         msg_type = msg.get("type")
         text_body = msg.get("text", {}).get("body", "") if msg_type == "text" else ""
+        utext = (text_body or "").lower()
         to = f"+{wa_from}"
+
+        # Guard: "tem X?" onde X não é do catálogo → NÃO consultar Sheets; responde educado
+        noun = noun_after_tem(utext)
+        if noun and not noun_in_catalog(noun):
+            msg_out = (f"Não trabalhamos com “{noun}”. Somos uma loja de eletrônicos. "
+                       f"Posso ajudar com impressoras térmicas, carrinhos RC, amoladores e etiquetas.")
+            send_whatsapp_message(to, msg_out)
+            return JSONResponse({"status":"processed","echo":"non_catalog_noun"}, status_code=200)
 
         # 1) Comandos
         routed = route_command(text_body)
@@ -323,38 +379,48 @@ async def receive_webhook(request: Request):
                 out = ("Pode falar comigo normalmente 😊\n"
                        "Para consultar o catálogo: /sku RC-124 ou /buscar impressora 80mm\n"
                        "Para cancelar: /cancel")
-                send_whatsapp_message(to, out); return JSONResponse({"status":"processed"}, status_code=200)
+                send_whatsapp_message(to, out)
+                return JSONResponse({"status":"processed"}, status_code=200)
 
             if kind == "cancel":
                 out = "Prontinho! Se quiser, posso consultar algo do catálogo — é só mandar /sku ou /buscar."
-                send_whatsapp_message(to, out); return JSONResponse({"status":"processed"}, status_code=200)
+                send_whatsapp_message(to, out)
+                return JSONResponse({"status":"processed"}, status_code=200)
 
             if kind == "sku":
                 if not arg:
-                    send_whatsapp_message(to, "Me envie assim: /sku RC-124"); return JSONResponse({"status":"processed"}, status_code=200)
+                    send_whatsapp_message(to, "Me envie assim: /sku RC-124")
+                    return JSONResponse({"status":"processed"}, status_code=200)
                 item = find_by_sku(arg)
                 if not item:
-                    send_whatsapp_message(to, f"Não encontrei o SKU {arg}. Confere o código pra mim?"); return JSONResponse({"status":"processed"}, status_code=200)
+                    send_whatsapp_message(to, f"Não encontrei o SKU {arg}. Confere o código pra mim?")
+                    return JSONResponse({"status":"processed"}, status_code=200)
                 preco = fmt_price(item.get("preco",""), item.get("moeda",""))
                 out = (f"{item.get('sku','—')} — {item.get('nome','')}\n"
                        f"Preço: {preco} | Estoque: {item.get('estoque','—')} | Prazo: {item.get('lead_time','—')}")
-                send_whatsapp_message(to, out); return JSONResponse({"status":"processed"}, status_code=200)
+                send_whatsapp_message(to, out)
+                return JSONResponse({"status":"processed"}, status_code=200)
 
             if kind == "buscar":
                 if not arg:
-                    send_whatsapp_message(to, "Me diga o que buscar, ex.: /buscar impressora térmica 80mm"); return JSONResponse({"status":"processed"}, status_code=200)
-                reply_catalog_search(to, arg); return JSONResponse({"status":"processed"}, status_code=200)
+                    send_whatsapp_message(to, "Me diga o que buscar, ex.: /buscar impressora térmica 80mm")
+                    return JSONResponse({"status":"processed"}, status_code=200)
+                reply_catalog_search(to, arg)
+                return JSONResponse({"status":"processed"}, status_code=200)
 
-            send_whatsapp_message(to, "Não reconheci esse comando. Use /help 😉"); return JSONResponse({"status":"processed"}, status_code=200)
+            send_whatsapp_message(to, "Não reconheci esse comando. Use /help 😉")
+            return JSONResponse({"status":"processed"}, status_code=200)
 
-        # 2) Regra de intenção: só consulta Sheets quando fizer sentido
+        # 2) Intenção de catálogo → consulta Sheets
         if is_catalog_intent(text_body):
             df = load_catalog()
             if catalog_overview_requested(text_body) and df is not None:
-                reply_catalog_overview(to, df); return JSONResponse({"status":"processed"}, status_code=200)
-            reply_catalog_search(to, text_body); return JSONResponse({"status":"processed"}, status_code=200)
+                reply_catalog_overview(to, df)
+                return JSONResponse({"status":"processed"}, status_code=200)
+            reply_catalog_search(to, text_body)
+            return JSONResponse({"status":"processed"}, status_code=200)
 
-        # 3) Caso contrário: conversa 100% LLM
+        # 3) Caso contrário: conversa 100% LLM (sem catálogo)
         reply = llm_reply(text_body)
         send_whatsapp_message(to, reply)
         return JSONResponse({"status":"processed"}, status_code=200)
